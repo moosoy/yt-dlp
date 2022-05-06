@@ -674,26 +674,30 @@ def sanitize_open(filename, open_mode):
 
     It returns the tuple (stream, definitive_file_name).
     """
-    try:
-        if filename == '-':
-            if sys.platform == 'win32':
-                import msvcrt
-                msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
-            return (sys.stdout.buffer if hasattr(sys.stdout, 'buffer') else sys.stdout, filename)
-        stream = locked_file(filename, open_mode, block=False).open()
-        return (stream, filename)
-    except (IOError, OSError) as err:
-        if err.errno in (errno.EACCES,):
-            raise
+    if filename == '-':
+        if sys.platform == 'win32':
+            import msvcrt
+            msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        return (sys.stdout.buffer if hasattr(sys.stdout, 'buffer') else sys.stdout, filename)
 
-        # In case of error, try to remove win32 forbidden chars
-        alt_filename = sanitize_path(filename)
-        if alt_filename == filename:
-            raise
-        else:
-            # An exception here should be caught in the caller
-            stream = locked_file(filename, open_mode, block=False).open()
-            return (stream, alt_filename)
+    for attempt in range(2):
+        try:
+            try:
+                if sys.platform == 'win32':
+                    # FIXME: An exclusive lock also locks the file from being read.
+                    # Since windows locks are mandatory, don't lock the file on windows (for now).
+                    # Ref: https://github.com/yt-dlp/yt-dlp/issues/3124
+                    raise LockingUnsupportedError()
+                stream = locked_file(filename, open_mode, block=False).__enter__()
+            except LockingUnsupportedError:
+                stream = open(filename, open_mode)
+            return (stream, filename)
+        except (IOError, OSError) as err:
+            if attempt or err.errno in (errno.EACCES,):
+                raise
+            old_filename, filename = filename, sanitize_path(filename)
+            if old_filename == filename:
+                raise
 
 
 def timeconvert(timestr):
@@ -1040,7 +1044,7 @@ def make_HTTPS_handler(params, **kwargs):
 
 
 def bug_reports_message(before=';'):
-    msg = ('please report this issue on  https://github.com/yt-dlp/yt-dlp , '
+    msg = ('please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , '
            'filling out the appropriate issue template. '
            'Confirm you are on the latest version using  yt-dlp -U')
 
@@ -2120,6 +2124,13 @@ def intlist_to_bytes(xs):
     return compat_struct_pack('%dB' % len(xs), *xs)
 
 
+class LockingUnsupportedError(IOError):
+    msg = 'File locking is not supported on this platform'
+
+    def __init__(self):
+        super().__init__(self.msg)
+
+
 # Cross-platform file locking
 if sys.platform == 'win32':
     import ctypes.wintypes
@@ -2180,18 +2191,15 @@ else:
         import fcntl
 
         def _lock_file(f, exclusive, block):
+            flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if not block:
+                flags |= fcntl.LOCK_NB
             try:
-                fcntl.flock(f,
-                            fcntl.LOCK_SH if not exclusive
-                            else fcntl.LOCK_EX if block
-                            else fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, flags)
             except BlockingIOError:
                 raise
             except OSError:  # AOSP does not have flock()
-                fcntl.lockf(f,
-                            fcntl.LOCK_SH if not exclusive
-                            else fcntl.LOCK_EX if block
-                            else fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(f, flags)
 
         def _unlock_file(f):
             try:
@@ -2200,58 +2208,70 @@ else:
                 fcntl.lockf(f, fcntl.LOCK_UN)
 
     except ImportError:
-        UNSUPPORTED_MSG = 'file locking is not supported on this platform'
 
         def _lock_file(f, exclusive, block):
-            raise IOError(UNSUPPORTED_MSG)
+            raise LockingUnsupportedError()
 
         def _unlock_file(f):
-            raise IOError(UNSUPPORTED_MSG)
+            raise LockingUnsupportedError()
 
 
 class locked_file(object):
-    _closed = False
+    locked = False
 
     def __init__(self, filename, mode, block=True, encoding=None):
-        assert mode in ['r', 'rb', 'a', 'ab', 'w', 'wb']
-        self.f = io.open(filename, mode, encoding=encoding)
-        self.mode = mode
-        self.block = block
+        if mode not in {'r', 'rb', 'a', 'ab', 'w', 'wb'}:
+            raise NotImplementedError(mode)
+        self.mode, self.block = mode, block
+
+        writable = any(f in mode for f in 'wax+')
+        readable = any(f in mode for f in 'r+')
+        flags = functools.reduce(operator.ior, (
+            getattr(os, 'O_CLOEXEC', 0),  # UNIX only
+            getattr(os, 'O_BINARY', 0),  # Windows only
+            getattr(os, 'O_NOINHERIT', 0),  # Windows only
+            os.O_CREAT if writable else 0,  # O_TRUNC only after locking
+            os.O_APPEND if 'a' in mode else 0,
+            os.O_EXCL if 'x' in mode else 0,
+            os.O_RDONLY if not writable else os.O_RDWR if readable else os.O_WRONLY,
+        ))
+
+        self.f = os.fdopen(os.open(filename, flags), mode, encoding=encoding)
 
     def __enter__(self):
         exclusive = 'r' not in self.mode
         try:
             _lock_file(self.f, exclusive, self.block)
+            self.locked = True
         except IOError:
             self.f.close()
             raise
+        if 'w' in self.mode:
+            self.f.truncate()
         return self
 
-    def __exit__(self, etype, value, traceback):
+    def unlock(self):
+        if not self.locked:
+            return
         try:
-            if not self._closed:
-                _unlock_file(self.f)
+            _unlock_file(self.f)
+        finally:
+            self.locked = False
+
+    def __exit__(self, *_):
+        try:
+            self.unlock()
         finally:
             self.f.close()
-            self._closed = True
+
+    open = __enter__
+    close = __exit__
+
+    def __getattr__(self, attr):
+        return getattr(self.f, attr)
 
     def __iter__(self):
         return iter(self.f)
-
-    def write(self, *args):
-        return self.f.write(*args)
-
-    def read(self, *args):
-        return self.f.read(*args)
-
-    def flush(self):
-        self.f.flush()
-
-    def open(self):
-        return self.__enter__()
-
-    def close(self, *args):
-        self.__exit__(self, *args, value=False, traceback=False)
 
 
 def get_filesystem_encoding():
@@ -2883,6 +2903,7 @@ class PagedList:
 
 
 class OnDemandPagedList(PagedList):
+    """Download pages until a page with less than maximum results"""
     def _getslice(self, start, end):
         for pagenum in itertools.count(start // self._pagesize):
             firstid = pagenum * self._pagesize
@@ -2922,6 +2943,7 @@ class OnDemandPagedList(PagedList):
 
 
 class InAdvancePagedList(PagedList):
+    """PagedList with total number of pages known in advance"""
     def __init__(self, pagefunc, pagecount, pagesize):
         PagedList.__init__(self, pagefunc, pagesize, True)
         self._pagecount = pagecount
@@ -3090,13 +3112,10 @@ def multipart_encode(data, boundary=None):
 
 
 def dict_get(d, key_or_keys, default=None, skip_false_values=True):
-    if isinstance(key_or_keys, (list, tuple)):
-        for key in key_or_keys:
-            if key not in d or d[key] is None or skip_false_values and not d[key]:
-                continue
-            return d[key]
-        return default
-    return d.get(key_or_keys, default)
+    for val in map(d.get, variadic(key_or_keys)):
+        if val is not None and (val or not skip_false_values):
+            return val
+    return default
 
 
 def try_call(*funcs, expected_type=None, args=[], kwargs={}):
@@ -3322,6 +3341,10 @@ def error_to_compat_str(err):
     if sys.version_info[0] < 3:
         err_str = err_str.decode(preferredencoding())
     return err_str
+
+
+def error_to_str(err):
+    return f'{type(err).__name__}: {err}'
 
 
 def mimetype2ext(mt):
