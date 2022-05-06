@@ -7,6 +7,7 @@ jobs:
   prepare_upload:
     runs-on: ubuntu-latest
     outputs:
+      tag_name: ${{ steps.get_tag_name.outputs.tag_name }}
       upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
     - name: Get Tag Name
@@ -39,6 +40,7 @@ jobs:
     - name: Run PyInstaller Script with --onedir
       run: |
         /usr/bin/python3 pyinst.py --onedir
+        echo ${{ needs.prepare_upload.outputs.tag_name }} > dist/yt-dlp_macos/yt-dlp_macos.check
         ditto -c -k --sequesterRsrc --keepParent dist/yt-dlp_macos yt-dlp_macos.zip
     - name: Upload yt-dlp MacOS onedir
       id: upload-release-macos-zip
@@ -66,6 +68,7 @@ jobs:
     - name: Run PyInstaller Script with --onedir
       run: |
         /usr/bin/python3 pyinst.py --target-architecture universal2 --onedir
+        echo ${{ needs.prepare_upload.outputs.tag_name }} > dist/yt-dlp_macos/yt-dlp_macos.check
         ditto -c -k --sequesterRsrc --keepParent dist/yt-dlp_macos yt-dlp_macos.zip
     - name: Upload yt-dlp MacOS onedir
       id: upload-release-macos-zip
